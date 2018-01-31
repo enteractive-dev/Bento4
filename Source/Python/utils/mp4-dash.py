@@ -83,8 +83,8 @@ CENC_2013_NAMESPACE         = 'urn:mpeg:cenc:2013'
 
 DASH_DEFAULT_ROLE_NAMESPACE = 'urn:mpeg:dash:role:2011'
 
-DASH_MEDIA_SEGMENT_URL_PATTERN_SMOOTH = "/QualityLevels($Bandwidth$)/Fragments(%s=$Time$)"
-DASH_MEDIA_SEGMENT_URL_PATTERN_HIPPO  = '%s/Bitrate($Bandwidth$)/Fragment($Time$)'
+MEDIA_SEGMENT_URL_PATTERN_SMOOTH = "QualityLevels(%s)/Fragments(%s=%s)"
+MEDIA_SEGMENT_URL_PATTERN_HIPPO  = '%s/Bitrate(%s)/Fragment(%s)'
 
 HIPPO_MEDIA_SEGMENT_REGEXP_DEFAULT = '%s/Bitrate\\\\(%d\\\\)/Fragment\\\\((\\\\d+)\\\\)'
 HIPPO_MEDIA_SEGMENT_GROUPS_DEFAULT = '["time"]'
@@ -162,10 +162,10 @@ def AddSegmentTemplate(options, container, init_segment_url, media_url_template_
         use_template_numbers = True
         if options.smooth:
             url_base = path.basename(options.smooth_server_manifest_filename)
-            url_template = url_base + DASH_MEDIA_SEGMENT_URL_PATTERN_SMOOTH % stream_name
+            url_template = url_base + "/" + MEDIA_SEGMENT_URL_PATTERN_SMOOTH % ("$Bandwidth$", stream_name, "$Time$")
             use_template_numbers = False
         elif options.hippo:
-            url_template = DASH_MEDIA_SEGMENT_URL_PATTERN_HIPPO % stream_name
+            url_template = MEDIA_SEGMENT_URL_PATTERN_HIPPO % (stream_name, "$Bandwidth$", "$Time$")
             use_template_numbers = False
 
         args = [container, 'SegmentTemplate']
@@ -571,10 +571,10 @@ def OutputDash(options, set_attributes, audio_sets, video_sets, subtitles_sets, 
 
 
 #############################################
-def OutputHlsTrack(options, track, media_subdir, media_playlist_name, media_file_name):
+def OutputHlsTrack(options, track, media_subdir, media_playlist_name, media_file_name, stream_name):
     hls_target_duration = math.ceil(max(track.segment_durations))
 
-    media_playlist_file = open(path.join(options.output_dir, media_subdir, media_playlist_name), 'w+')
+    media_playlist_file = open(path.join(options.output_dir, media_subdir, media_playlist_name), 'wb+')
     media_playlist_file.write('#EXTM3U\r\n')
     media_playlist_file.write('# Created with Bento4 mp4-dash.py, VERSION=' + VERSION + '-' + SDK_REVISION+'\r\n')
     media_playlist_file.write('#\r\n')
@@ -586,6 +586,8 @@ def OutputHlsTrack(options, track, media_subdir, media_playlist_name, media_file
     if options.on_demand:
         init_segment_size = track.moov_atom.position+track.moov_atom.size
         media_playlist_file.write('#EXT-X-MAP:URI="%s",BYTERANGE="%d@0"\r\n' % (media_file_name, init_segment_size))
+    elif options.use_segment_timeline:
+        media_playlist_file.write('#EXT-X-MAP:URI="%s"\r\n' % media_file_name)
     else:
         media_playlist_file.write('#EXT-X-MAP:URI="%s"\r\n' % (SPLIT_INIT_SEGMENT_NAME))
         segment_pattern = SEGMENT_PATTERN.replace('ll','')
@@ -594,6 +596,7 @@ def OutputHlsTrack(options, track, media_subdir, media_playlist_name, media_file
         key_info = options.track_key_infos.get(track.id)
         media_playlist_file.write('#EXT-X-KEY:METHOD=SAMPLE-AES,URI="'+options.hls_key_url+'",IV=0x'+key_info['iv']+'\r\n')
 
+    scaled_timestamp = 0
     for i in range(len(track.segment_durations)):
         media_playlist_file.write('#EXTINF:%f,\r\n' % (track.segment_durations[i]))
         if options.on_demand:
@@ -602,6 +605,15 @@ def OutputHlsTrack(options, track, media_subdir, media_playlist_name, media_file
             segment_size     = reduce(operator.add, [atom.size for atom in segment], 0)
             media_playlist_file.write('#EXT-X-BYTERANGE:%d@%d\r\n' % (segment_size, segment_position))
             media_playlist_file.write(media_file_name)
+        elif options.use_segment_timeline:
+            url_template = SEGMENT_URL_TEMPLATE
+            if options.smooth:
+                url_base = path.basename(options.smooth_server_manifest_filename)
+                url_template = url_base + "/" + MEDIA_SEGMENT_URL_PATTERN_SMOOTH % (track.bandwidth, stream_name, scaled_timestamp)
+            elif options.hippo:
+                url_template = MEDIA_SEGMENT_URL_PATTERN_HIPPO % (stream_name, track.bandwidth, scaled_timestamp)
+            scaled_timestamp += track.segment_scaled_durations[i]
+            media_playlist_file.write(url_template)
         else:
             media_playlist_file.write(segment_pattern % (i+1))
         media_playlist_file.write('\r\n')
@@ -614,7 +626,7 @@ def OutputHls(options, set_attributes, audio_sets, video_sets, subtitles_sets, s
     all_video_tracks     = sum(video_sets.values(),     [])
     all_subtitles_tracks = sum(subtitles_sets.values(), [])
 
-    master_playlist_file = open(path.join(options.output_dir, options.hls_master_playlist_name), 'w+');
+    master_playlist_file = open(path.join(options.output_dir, options.hls_master_playlist_name), 'wb+');
     master_playlist_file.write('#EXTM3U\r\n')
     master_playlist_file.write('# Created with Bento4 mp4-dash.py, VERSION=' + VERSION + '-' + SDK_REVISION+'\r\n')
     master_playlist_file.write('#\r\n')
@@ -657,21 +669,27 @@ def OutputHls(options, set_attributes, audio_sets, video_sets, subtitles_sets, s
                 #base_url.text = ONDEMAND_MEDIA_FILE_PATTERN % (options.media_prefix, audio_track.representation_id)
                 #sidx_range = (audio_track.sidx_atom.position, audio_track.sidx_atom.position+audio_track.sidx_atom.size-1)
                 #init_range = (0, audio_track.moov_atom.position+audio_track.moov_atom.size-1)
+            elif options.split:
+                media_subdir        = audio_track.representation_id
+                media_file_name     = ''
+                media_playlist_name = options.hls_media_playlist_name
+                media_playlist_path = media_subdir+'/'+media_playlist_name
+            elif options.use_segment_timeline:
+                media_subdir        = ''
+                media_file_name     = NOSPLIT_INIT_FILE_PATTERN % audio_track.representation_id
+                media_playlist_name = media_file_name.replace(".mp4", ".m3u8")
+                media_playlist_path = media_playlist_name
             else:
-                if options.split:
-                    media_subdir        = audio_track.representation_id
-                    media_file_name     = ''
-                    media_playlist_name = options.hls_media_playlist_name
-                    media_playlist_path = media_subdir+'/'+media_playlist_name
-                else:
-                    raise Exception('mode not yet supported with HLS')
+                raise Exception('mode not yet supported with HLS')
 
             master_playlist_file.write(('#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="%s",LANGUAGE="%s",NAME="%s",AUTOSELECT=YES,DEFAULT=YES,URI="%s"\r\n' % (
                                         audio_group_name,
                                         language,
                                         language_name,
                                         media_playlist_path)).encode('utf-8'))
-            OutputHlsTrack(options, audio_track, media_subdir, media_playlist_name, media_file_name)
+            
+            stream_name = "audio_"+audio_track.language
+            OutputHlsTrack(options, audio_track, media_subdir, media_playlist_name, media_file_name, stream_name)
 
     master_playlist_file.write('\r\n')
     master_playlist_file.write('# Video\r\n')
@@ -681,14 +699,18 @@ def OutputHls(options, set_attributes, audio_sets, video_sets, subtitles_sets, s
             media_file_name     = video_track.parent.media_name
             media_playlist_name = media_file_name.replace(".mp4", ".m3u8")
             media_playlist_path = media_playlist_name
+        elif options.split:
+            media_subdir        = video_track.representation_id
+            media_file_name     = ''
+            media_playlist_name = options.hls_media_playlist_name
+            media_playlist_path = media_subdir+'/'+media_playlist_name
+        elif options.use_segment_timeline:
+            media_subdir        = ''
+            media_file_name     = NOSPLIT_INIT_FILE_PATTERN % video_track.representation_id
+            media_playlist_name = media_file_name.replace(".mp4", ".m3u8")
+            media_playlist_path = media_playlist_name
         else:
-            if options.split:
-                media_subdir        = video_track.representation_id
-                media_file_name     = ''
-                media_playlist_name = options.hls_media_playlist_name
-                media_playlist_path = media_subdir+'/'+media_playlist_name
-            else:
-                raise Exception('mode not yet supported with HLS')
+            raise Exception('mode not yet supported with HLS')
 
 
         if len(audio_groups):
@@ -713,7 +735,7 @@ def OutputHls(options, set_attributes, audio_sets, video_sets, subtitles_sets, s
                                        video_track.height))
             master_playlist_file.write(media_playlist_path+'\r\n')
 
-        OutputHlsTrack(options, video_track, media_subdir, media_playlist_name, media_file_name)
+        OutputHlsTrack(options, video_track, media_subdir, media_playlist_name, media_file_name, "video")
 
 #############################################
 def OutputSmooth(options, audio_tracks, video_tracks):
@@ -734,7 +756,7 @@ def OutputSmooth(options, audio_tracks, video_tracks):
     # process the audio tracks
     for audio_track in audio_tracks:
         stream_name = "audio_"+audio_track.language
-        audio_url_pattern="QualityLevels({bitrate})/Fragments(%s={start time})" % (stream_name)
+        audio_url_pattern=MEDIA_SEGMENT_URL_PATTERN_SMOOTH % ("{bitrate}", stream_name, "{start time}")
         stream_index = xml.SubElement(client_manifest,
                                       'StreamIndex',
                                       Chunks=str(len(audio_track.moofs)),
@@ -781,7 +803,7 @@ def OutputSmooth(options, audio_tracks, video_tracks):
     if len(video_tracks):
         max_width  = max([track.width  for track in video_tracks])
         max_height = max([track.height for track in video_tracks])
-        video_url_pattern="QualityLevels({bitrate})/Fragments(video={start time})"
+        video_url_pattern=MEDIA_SEGMENT_URL_PATTERN_SMOOTH % ("{bitrate}", "video", "{start time}")
         stream_index = xml.SubElement(client_manifest,
                                       'StreamIndex',
                                        Chunks=str(len(video_tracks[0].moofs)),
@@ -1097,14 +1119,7 @@ def ResolveEncryptionKeys(options):
 
         key_info['key'] = key_hex
         key_info['kid'] = kid_hex
-        if options.hls:
-            # for HLS, we need to know the IV
-            import random
-            sys_random = random.SystemRandom()
-            random_iv = sys_random.getrandbits(128)
-            key_info['iv'] = '%016x' % random_iv
-        else:
-            key_info['iv'] = 'random'
+        key_info['iv'] = '00000000000000000000000000000000'
 
         options.key_infos.append(key_info)
 
